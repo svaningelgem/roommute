@@ -69,7 +69,7 @@ fn explain(code: u32) -> Option<&'static str> {
         // register these) whose DLL Windows cannot load. Opening the format
         // for the device pulls that chain in, which is why it surfaces here.
         0x8007_007E => {
-            "the device's audio enhancements could not be loaded — turn them off in              Settings, System, Sound, that device, or reinstall its audio driver"
+            "this microphone could not be opened — Windows could not load one of its              effect DLLs. Pick a different microphone from the tray menu; turning off              that device's audio enhancements also fixes it"
         }
         _ => return None,
     })
@@ -118,9 +118,12 @@ mod tests {
     #[cfg(windows)]
     /// ERROR_MOD_NOT_FOUND out of GetMixFormat, reported from a real machine.
     /// Windows renders it as "The specified module could not be found", which
-    /// sounds like RoomMute is missing a DLL of its own. It is not: the audio
-    /// endpoint has an effects DLL registered that Windows cannot load, and
-    /// the fix is on the device, not in this app.
+    /// sounds like RoomMute is missing a DLL of its own. It is not: that
+    /// endpoint has an effect DLL Windows cannot load.
+    ///
+    /// The reporter fixed it by choosing another microphone, not by touching
+    /// any driver, so that is what the text leads with. RoomMute now tries the
+    /// other microphones itself before anyone sees this at all.
     #[test]
     fn a_missing_audio_effect_dll_says_so_rather_than_blaming_us() {
         let e = AudioError::wasapi(
@@ -129,8 +132,8 @@ mod tests {
         );
         let text = e.to_string();
         assert!(
-            text.contains("enhancement") || text.contains("effect"),
-            "point at audio enhancements, which is what this code means here: {text}"
+            text.contains("different microphone"),
+            "lead with the fix that actually worked — choosing another mic: {text}"
         );
         assert!(
             !text.contains("specified module could not be found"),

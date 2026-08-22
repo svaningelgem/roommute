@@ -73,14 +73,14 @@ pub struct Pipeline {
 impl Pipeline {
     /// Start against the real sound card.
     pub fn start(cfg: Arc<RwLock<Config>>) -> Result<Self> {
-        let (input_id, output_id) = Self::resolve_devices(&cfg.read().unwrap())?;
-        Self::build(&Wasapi, cfg, &input_id, &output_id)
+        let (input_ids, output_id) = Self::resolve_devices(&cfg.read().unwrap())?;
+        Self::build_ranked(&Wasapi, cfg, &input_ids, &output_id)
     }
 
     /// Pick the devices to use. Split out from [`Pipeline::build`] because it
     /// is the only part that needs a real sound card, which keeps the wiring
     /// testable.
-    fn resolve_devices(snapshot: &Config) -> Result<(String, String)> {
+    fn resolve_devices(snapshot: &Config) -> Result<(Vec<String>, String)> {
         let devices = DeviceList::enumerate().context("enumerating audio devices")?;
         Self::pick_devices(&devices, snapshot)
     }
@@ -88,13 +88,16 @@ impl Pipeline {
     /// Choose input and output from a device inventory. Separate from the
     /// enumeration so the rules — ranking, the feedback-loop guard, failing
     /// closed when there is no cable — can be tested without a sound card.
-    fn pick_devices(devices: &DeviceList, snapshot: &Config) -> Result<(String, String)> {
+    fn pick_devices(devices: &DeviceList, snapshot: &Config) -> Result<(Vec<String>, String)> {
         // Config names devices; ids are an internal detail resolved here,
         // fresh on every start and every restart.
-        let input = devices
-            .resolve_capture_ranked(&snapshot.microphones)
-            .ok_or_else(|| anyhow::anyhow!("no microphone is available"))?
-            .clone();
+        //
+        // Every candidate, not just the winner: a device can enumerate and
+        // still refuse to open, and the caller tries them in turn.
+        let candidates = devices.capture_candidates(&snapshot.microphones);
+        let input = *candidates
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no microphone is available"))?;
         // Say so when the preferred one wasn't there, so a silent downgrade to
         // the laptop's built-in mic isn't a mystery later.
         if let Some(preferred) = snapshot.microphones.first() {
@@ -134,13 +137,60 @@ impl Pipeline {
                 )
             })?
             .clone();
-        let (input_id, output_id) = (input.id.clone(), output.id.clone());
-        info!(mic = %input.friendly_name, to = %output.friendly_name, "using devices");
-        Ok((input_id, output_id))
+        // The feedback-loop guard above tested the first choice; the rest of
+        // the list still has to be checked, or a fallback could route the
+        // cable into itself.
+        let input_ids: Vec<String> = candidates
+            .iter()
+            .filter(|d| d.virtual_cable_output().is_none())
+            .map(|d| d.id.clone())
+            .collect();
+        info!(
+            mic = %input.friendly_name,
+            fallbacks = input_ids.len().saturating_sub(1),
+            to = %output.friendly_name,
+            "using devices"
+        );
+        Ok((input_ids, output.id.clone()))
     }
 
     /// Wire capture -> ring -> DSP -> ring -> render, against whatever audio
     /// backend is handed in.
+    /// Try each microphone in turn, keeping the first that actually opens.
+    ///
+    /// A device being listed does not mean it can be used: an endpoint whose
+    /// effects chain is broken enumerates perfectly and then fails to open,
+    /// which is how one reporter ended up staring at a dialog with three
+    /// working microphones plugged in. Picking the next candidate is exactly
+    /// what the preference list is for, and it already happens when a device
+    /// disappears mid-call — it just never happened at startup.
+    ///
+    /// Only when every candidate has failed does the error reach the user, and
+    /// it is the last real failure rather than a summary.
+    fn build_ranked(
+        io: &dyn AudioIo,
+        cfg: Arc<RwLock<Config>>,
+        input_ids: &[String],
+        output_id: &str,
+    ) -> Result<Self> {
+        let mut last: Option<anyhow::Error> = None;
+        for id in input_ids {
+            match Self::build(io, cfg.clone(), id, output_id) {
+                Ok(p) => {
+                    if last.is_some() {
+                        info!(device = %id, "started on a fallback microphone");
+                    }
+                    return Ok(p);
+                }
+                Err(e) => {
+                    warn!(device = %id, error = %format!("{e:#}"), "microphone would not open; trying the next");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("no microphone is available")))
+    }
+
     fn build(
         io: &dyn AudioIo,
         cfg: Arc<RwLock<Config>>,
@@ -424,7 +474,7 @@ mod tests {
 
     /// Deterministic tone plus hiss. Generated rather than checked in: no
     /// binary in git, no licence to honour, and identical on every machine.
-    fn test_signal(frames: usize) -> Vec<Frame> {
+    pub(super) fn test_signal(frames: usize) -> Vec<Frame> {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         (0..frames)
             .map(|i| {
@@ -443,7 +493,7 @@ mod tests {
             .collect()
     }
 
-    fn config(enabled: bool) -> Arc<RwLock<Config>> {
+    pub(super) fn config(enabled: bool) -> Arc<RwLock<Config>> {
         Arc::new(RwLock::new(Config {
             enabled,
             ..Config::default()
@@ -580,16 +630,22 @@ mod tests {
             &["Webcam Mic", "Yeti"],
             &["CABLE Input (VB-Audio Virtual Cable)"],
         );
-        let (input, output) =
+        let (inputs, output) =
             Pipeline::pick_devices(&devices, &with_mics(&["Yeti", "Webcam Mic"])).unwrap();
-        assert!(input.ends_with("Yeti"), "got {input}");
+        assert!(inputs[0].ends_with("Yeti"), "got {inputs:?}");
         assert!(output.contains("CABLE Input"));
+        // The rest stay behind it as fallbacks, in preference order, so a mic
+        // that enumerates but will not open is not the end of the road.
+        assert!(
+            inputs.len() > 1 && inputs[1].ends_with("Webcam Mic"),
+            "the runner-up has to survive as a fallback: {inputs:?}"
+        );
 
         // Unplug the Yeti: the next one down takes over rather than failing.
         let devices = inventory(&["Webcam Mic"], &["CABLE Input (VB-Audio Virtual Cable)"]);
-        let (input, _) =
+        let (inputs, _) =
             Pipeline::pick_devices(&devices, &with_mics(&["Yeti", "Webcam Mic"])).unwrap();
-        assert!(input.ends_with("Webcam Mic"), "got {input}");
+        assert!(inputs[0].ends_with("Webcam Mic"), "got {inputs:?}");
     }
 
     /// Installing a cable usually makes it the default capture device too, so
@@ -656,6 +712,113 @@ mod tests {
             settled,
             io.rendered.lock().unwrap().len(),
             "frames kept arriving after the pipeline was dropped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::tests::{config, test_signal};
+    use super::{AudioIo, FrameSink, Pipeline};
+    use anyhow::Result;
+
+    /// A sound card where one named device exists but refuses to open.
+    ///
+    /// This is what a reporter hit: `GetMixFormat` returned 0x8007007E for the
+    /// microphone we picked, and RoomMute stopped at a dialog even though
+    /// other working microphones were plugged in. Selecting one by hand fixed
+    /// it, which is the app's job, not the user's.
+    struct OneBadMic {
+        bad: &'static str,
+        attempts: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    struct Handle(Arc<AtomicBool>);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl AudioIo for OneBadMic {
+        fn start_capture(&self, id: &str, mut sink: Box<dyn FrameSink>) -> Result<Box<dyn Send>> {
+            self.attempts.lock().unwrap().push(id.to_string());
+            if id == self.bad {
+                anyhow::bail!(
+                    "GetMixFormat failed: the device's audio enhancements could not be \
+                     loaded (0x8007007E)"
+                );
+            }
+            let frames = test_signal(4);
+            let stop = self.stop.clone();
+            std::thread::spawn(move || {
+                for f in frames {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    sink.on_frame(&f);
+                }
+            });
+            Ok(Box::new(Handle(self.stop.clone())))
+        }
+
+        fn start_render(
+            &self,
+            _id: &str,
+            _source: Box<dyn super::FrameSource>,
+        ) -> Result<Box<dyn Send>> {
+            Ok(Box::new(Handle(self.stop.clone())))
+        }
+    }
+
+    #[test]
+    fn a_microphone_that_will_not_open_falls_through_to_the_next() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let io = OneBadMic {
+            bad: "broken-mic",
+            attempts: attempts.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+
+        let p = Pipeline::build_ranked(
+            &io,
+            config(true),
+            &["broken-mic".to_string(), "good-mic".to_string()],
+            "out",
+        );
+
+        assert!(
+            p.is_ok(),
+            "a working microphone was available; refusing to start is the bug"
+        );
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["broken-mic", "good-mic"],
+            "it has to try the next candidate, in order"
+        );
+    }
+
+    #[test]
+    fn the_error_survives_when_every_microphone_fails() {
+        let io = OneBadMic {
+            bad: "broken-mic",
+            attempts: Arc::new(Mutex::new(Vec::new())),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let err = Pipeline::build_ranked(&io, config(true), &["broken-mic".to_string()], "out");
+        // Matched rather than `expect_err`: Pipeline owns thread handles and
+        // is not Debug, so unwrapping the error needs no formatting of the Ok.
+        let Err(err) = err else {
+            panic!("nothing could open, so this must fail");
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("0x8007007E"),
+            "the last real reason has to reach the user: {text}"
         );
     }
 }

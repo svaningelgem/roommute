@@ -192,10 +192,30 @@ impl DeviceList {
     /// Walking the list rather than insisting on one device is what makes an
     /// unplugged microphone a non-event: the next one down takes over.
     pub fn resolve_capture_ranked(&self, preferences: &[String]) -> Option<&Device> {
-        preferences
+        self.capture_candidates(preferences).into_iter().next()
+    }
+
+    /// Every microphone worth trying, best first: the preferences that exist,
+    /// then the Windows default as the floor.
+    ///
+    /// A list rather than one choice, because being enumerated does not mean a
+    /// device can be opened — an endpoint with a broken effects chain lists
+    /// fine and then fails, and the caller needs somewhere to go next.
+    /// Deduplicated, so the default is not tried twice when it is also a
+    /// preference.
+    pub fn capture_candidates(&self, preferences: &[String]) -> Vec<&Device> {
+        let mut out: Vec<&Device> = Vec::new();
+        let mut candidates: Vec<&Device> = preferences
             .iter()
-            .find_map(|name| self.resolve_capture(name))
-            .or_else(|| self.default_capture())
+            .filter_map(|n| self.resolve_capture(n))
+            .collect();
+        candidates.extend(self.default_capture());
+        for d in candidates {
+            if !out.iter().any(|seen| seen.id == d.id) {
+                out.push(d);
+            }
+        }
+        out
     }
 
     /// Where to render: an explicitly named device, else the one virtual cable.
