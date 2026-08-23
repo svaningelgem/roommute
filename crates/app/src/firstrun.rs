@@ -76,6 +76,44 @@ pub fn model_missing(expected: &std::path::Path) {
     crate::message_box(&missing_text(expected));
 }
 
+/// Shown once, after the first successful start, and from Help afterwards.
+///
+/// It exists because a tray app that is working perfectly still looks broken:
+/// the audio goes somewhere the user has not pointed anything at yet. A
+/// reporter hit exactly that — RoomMute was running fine and they had no idea
+/// which microphone it had chosen or what to select in their meeting software.
+///
+/// `cable` must be the capture half. RoomMute renders *into* "CABLE Input";
+/// naming that here would send people to the endpoint that produces silence.
+pub fn welcome_text(mic: &str, cable: Option<&str>) -> String {
+    let routing = match cable {
+        Some(name) => format!(
+            "To let other apps hear the cleaned sound, pick\n\n    {name}\n\n\
+             as the microphone in Discord, Zoom, Teams, OBS or whatever you use. \
+             Selecting RoomMute itself will not work — it is not a microphone."
+        ),
+        // Nothing to point anyone at, and the cable prompt has said its piece.
+        None => "No virtual audio cable is installed yet, so other apps cannot hear the \
+                 cleaned sound. RoomMute will offer to set that up."
+            .to_string(),
+    };
+    format!(
+        "Thanks for using RoomMute.\n\n\
+         Your microphone is set to\n\n    {mic}\n\n\
+         and you can change it any time from the RoomMute icon near the clock, at the \
+         bottom right of your screen.\n\n\
+         {routing}\n\n\
+         This is shown once. You can read it again from Help in the same menu."
+    )
+}
+
+/// Show it, and say whether it was actually shown, so the caller only records
+/// "seen" when it was.
+pub fn show_welcome(mic: &str, cable: Option<&str>) {
+    info!(mic, cable, "showing the welcome");
+    crate::message_box_info(&welcome_text(mic, cable));
+}
+
 fn missing_text(expected: &std::path::Path) -> String {
     format!(
         "The high-quality model isn't installed yet.\n\n\
@@ -92,6 +130,44 @@ fn missing_text(expected: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two things this message exists to say, and the one it must not get
+    /// wrong: RoomMute renders into "CABLE Input", so naming that half here
+    /// would send someone to the endpoint that produces silence.
+    #[test]
+    fn the_welcome_names_the_mic_and_the_right_half_of_the_cable() {
+        let text = welcome_text(
+            "Microphone (Yeti)",
+            Some("CABLE Output (VB-Audio Virtual Cable)"),
+        );
+        assert!(
+            text.contains("Microphone (Yeti)"),
+            "name the mic in use: {text}"
+        );
+        assert!(
+            text.contains("CABLE Output"),
+            "name what other apps pick: {text}"
+        );
+        assert!(
+            !text.contains("CABLE Input"),
+            "that half is where RoomMute writes; picking it gives silence: {text}"
+        );
+        assert!(
+            text.contains("bottom right"),
+            "someone who has never seen a tray icon needs to be told where: {text}"
+        );
+        assert!(text.contains("Help"), "say how to read it again: {text}");
+    }
+
+    /// With no cable there is nothing to point at. It must not name a device
+    /// that does not exist or tell anyone to go picking one.
+    #[test]
+    fn the_welcome_admits_when_there_is_no_cable_yet() {
+        let text = welcome_text("Microphone (Yeti)", None);
+        assert!(text.contains("Microphone (Yeti)"), "{text}");
+        assert!(text.contains("cable is installed"), "{text}");
+        assert!(!text.contains("pick\n"), "nothing to pick yet: {text}");
+    }
 
     #[test]
     fn links_point_where_we_say_they_do() {

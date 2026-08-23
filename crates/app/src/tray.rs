@@ -242,6 +242,7 @@ struct Items {
     mics: Vec<MicEntry>,
     denoisers: Vec<DenoiserEntry>,
     auto_start: CheckMenuItem,
+    help: MenuItem,
     open_logs: MenuItem,
     quit: MenuItem,
 }
@@ -464,6 +465,9 @@ fn build_menu(cfg: &Config) -> (Menu, Items) {
     );
     menu.append(&auto_start).ok();
 
+    let help = MenuItem::new("Help — how to use this", true, None);
+    menu.append(&help).ok();
+
     let open_logs = MenuItem::new("Open log folder", true, None);
     menu.append(&open_logs).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
@@ -478,6 +482,7 @@ fn build_menu(cfg: &Config) -> (Menu, Items) {
             mics,
             denoisers,
             auto_start,
+            help,
             open_logs,
             quit,
         },
@@ -591,6 +596,56 @@ impl App {
         info!(enabled, "denoising toggled");
     }
 
+    /// Show the welcome the first time, and never again.
+    ///
+    /// Only when audio is actually running: the message says which microphone
+    /// is in use and where to point other apps, and neither is true yet if
+    /// startup failed. Someone in that state has already been told what went
+    /// wrong, and stacking a cheerful welcome on top of it helps nobody — they
+    /// get it on the first run that works.
+    ///
+    /// The flag is written before the dialog, not after. A modal blocks this
+    /// thread, and a crash or a kill while it is open would otherwise mean the
+    /// same message again on every start.
+    fn welcome_once(&mut self) {
+        if self.pipeline.is_none() || self.cfg.read().unwrap().welcomed {
+            return;
+        }
+        {
+            let mut c = self.cfg.write().unwrap();
+            c.welcomed = true;
+            if let Err(e) = c.save() {
+                warn!(error = %e, "could not record that the welcome was shown");
+            }
+        }
+        self.show_welcome();
+    }
+
+    /// The welcome, with whatever is actually true right now.
+    ///
+    /// Both names are read live rather than remembered: the pipeline may have
+    /// fallen through to a different microphone than the configured first
+    /// choice, and telling someone the wrong one is worse than telling them
+    /// nothing. The cable is looked up as the *capture* endpoint, because that
+    /// is the half other applications select.
+    fn show_welcome(&self) {
+        let devices = audio_io::devices::DeviceList::enumerate().ok();
+        let mic = devices
+            .as_ref()
+            .and_then(|d| {
+                let prefs = &self.cfg.read().unwrap().microphones;
+                d.capture_candidates(prefs)
+                    .first()
+                    .map(|d| d.friendly_name.clone())
+            })
+            .unwrap_or_else(|| "your default microphone".to_string());
+        let cable = devices
+            .as_ref()
+            .and_then(|d| d.virtual_cable_output_device())
+            .map(|d| d.friendly_name.clone());
+        crate::firstrun::show_welcome(&mic, cable.as_deref());
+    }
+
     /// Clicking a microphone makes it first choice; everything else shifts
     /// down. One rule, and it builds the fallback order out of ordinary use.
     fn select_mic(&mut self, device_id: String, name: String) {
@@ -666,6 +721,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.tray.is_some() {
             return;
         }
+        self.welcome_once();
         let (menu, items) = build_menu(&self.cfg.read().unwrap());
 
         let tooltip = self
@@ -736,6 +792,8 @@ impl ApplicationHandler<UserEvent> for App {
                     crate::message_box(&format!("Could not change start-with-Windows:\n\n{e:#}"));
                 }
             }
+        } else if id == *items.help.id() {
+            self.show_welcome();
         } else if id == *items.open_logs.id() {
             let _ = std::process::Command::new(explorer_path())
                 .arg(crate::config::log_dir())

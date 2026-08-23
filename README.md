@@ -80,7 +80,7 @@ Left-click the tray icon to toggle denoising. The icon shows the state at a glan
 | **orange** | bypassed, passing audio straight through |
 | **⚠ badge** | audio is not flowing — the device went away, and it is trying to recover |
 
-Right-click for the menu: pick a microphone, switch backend, toggle start-with-Windows, open the log folder.
+Right-click for the menu: pick a microphone, switch backend, toggle start-with-Windows, open the log folder, or **Help** — which repeats the first-run message naming the microphone in use and the device to select in Zoom, Discord and the rest.
 
 **Microphones are remembered in preference order.** Click one and it becomes first choice; the rest shift down. Unplug it mid-call and the next one down takes over on its own, rather than the app stopping to ask. Plug it back in and it is picked up again.
 
@@ -197,6 +197,7 @@ use_onnx = true           # true = DeepFilterNet3, false = RNNoise. The key
                           # is named for ONNX; the model runs through tract
 attenuation_db = 100.0    # how hard to suppress; 100 = no limit, 25 = gentler
 model_path = ""           # empty = use the model beside the executable
+welcomed = true           # the one-time welcome has been shown; Help reopens it
 ```
 
 Devices are named, not numbered. Endpoint IDs are opaque GUIDs that change every time you replug a device — names survive.

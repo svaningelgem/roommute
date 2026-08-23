@@ -218,6 +218,18 @@ impl DeviceList {
         out
     }
 
+    /// The capture endpoint other apps must select to hear cleaned audio.
+    ///
+    /// The cable has two halves and they are easy to confuse: RoomMute renders
+    /// into "CABLE Input", so telling a user to pick that in Discord sends
+    /// them to the wrong one and nothing works. This finds the real capture
+    /// endpoint instead of deriving a name by swapping the word.
+    pub fn virtual_cable_output_device(&self) -> Option<&Device> {
+        self.capture
+            .iter()
+            .find(|d| d.virtual_cable_output().is_some())
+    }
+
     /// Where to render: an explicitly named device, else the one virtual cable.
     pub fn resolve_render(&self, name: &str) -> Result<&Device> {
         if name.is_empty() {
@@ -238,6 +250,36 @@ impl DeviceList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Naming the wrong half of the cable is the difference between working
+    /// and silent, so this pins which one we hand to the user.
+    #[test]
+    fn the_endpoint_offered_to_other_apps_is_the_capture_half() {
+        let list = DeviceList {
+            capture: vec![
+                capture("Microphone (Yeti)"),
+                capture("CABLE Output (VB-Audio Virtual Cable)"),
+            ],
+            render: vec![render("CABLE Input (VB-Audio Virtual Cable)")],
+        };
+        let offered = list
+            .virtual_cable_output_device()
+            .expect("the cable is installed, so there is one");
+        assert!(
+            offered.friendly_name.starts_with("CABLE Output"),
+            "apps record from the Output half; we render into the Input half: {}",
+            offered.friendly_name
+        );
+    }
+
+    #[test]
+    fn no_cable_means_nothing_to_offer() {
+        let list = DeviceList {
+            capture: vec![capture("Microphone (Yeti)")],
+            render: vec![render("Speakers")],
+        };
+        assert!(list.virtual_cable_output_device().is_none());
+    }
 
     fn render(name: &str) -> Device {
         Device {

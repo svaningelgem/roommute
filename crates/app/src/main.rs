@@ -142,6 +142,22 @@ pub fn open_url(url: &str) {
     let _ = std::process::Command::new(explorer).arg(url).spawn();
 }
 
+/// Informational, not an error. Same box, different icon — a welcome with a
+/// red cross on it reads as a failure.
+#[cfg(windows)]
+pub fn message_box_info(text: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from("RoomMute"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
 #[cfg(windows)]
 pub fn message_box(text: &str) {
     use windows::core::HSTRING;

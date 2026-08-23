@@ -49,6 +49,10 @@ pub struct Config {
     /// would silently reset the setting in every existing config.toml.
     #[serde(default = "default_true")]
     pub use_onnx: bool,
+    /// Whether the welcome has been shown. Defaults to false so an existing
+    /// config, written before this key existed, still gets it once.
+    #[serde(default)]
+    pub welcomed: bool,
 }
 
 fn default_true() -> bool {
@@ -68,6 +72,7 @@ impl Default for Config {
             attenuation_db: default_atten(),
             model_path: String::new(),
             use_onnx: true,
+            welcomed: false,
         }
     }
 }
@@ -211,6 +216,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Shown once means once, including across a restart, so it has to be
+    /// written down rather than held in memory.
+    #[test]
+    fn the_welcome_is_remembered_as_seen() {
+        let dir = scratch("welcomed");
+        let path = dir.join("config.toml");
+
+        let mut c = Config::default();
+        assert!(!c.welcomed, "a fresh install has not seen it");
+        c.welcomed = true;
+        c.save_to(&path).unwrap();
+
+        assert!(
+            Config::load_from(&path).unwrap().welcomed,
+            "reloading must not show it a second time"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Someone upgrading has a config.toml with no such key. They have never
+    /// seen the welcome, so they should get it.
+    #[test]
+    fn a_config_from_before_this_key_still_gets_the_welcome() {
+        let c = Config::parse("microphones = [\"Yeti\"]").unwrap();
+        assert!(!c.welcomed);
     }
 
     #[test]
