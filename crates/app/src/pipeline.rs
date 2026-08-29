@@ -4,7 +4,7 @@
 //! at 8 frames (~80 ms) — enough headroom to absorb a scheduler hiccup,
 //! small enough that we don't hide actual problems.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -68,6 +68,24 @@ pub struct Pipeline {
     denoiser_name: &'static str,
     /// Used to ask the DSP thread to exit cleanly when we drop.
     shutdown: Arc<AtomicBool>,
+}
+
+/// DSP threads currently alive.
+///
+/// An instrument, not a statistic. The thread owns the denoiser — a whole
+/// DeepFilterNet3 graph — and polls every 2 ms, so one that outlives its
+/// pipeline costs both memory and a core forever. Counting them makes
+/// "starting audio and failing must leave nothing behind" a thing a test can
+/// assert instead of a thing to be careful about.
+pub(crate) static DSP_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements on the way out however the thread ends, panic included.
+struct ThreadCount;
+
+impl Drop for ThreadCount {
+    fn drop(&mut self) {
+        DSP_THREADS.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl Pipeline {
@@ -203,77 +221,10 @@ impl Pipeline {
         let (prod_a, mut cons_a) = HeapRb::<Frame>::new(RING_FRAMES).split();
         let (mut prod_b, cons_b) = HeapRb::<Frame>::new(RING_FRAMES).split();
 
-        // DSP setup.
-        let model_path = snapshot.active_model();
-        let denoiser = dsp::build_denoiser(model_path.as_deref(), snapshot.attenuation_db)
-            .context("loading denoiser")?;
-        let denoiser_name = denoiser.name();
-        let (mut host, bypass, stats) = DenoiserHost::new(denoiser);
-        bypass.store(!snapshot.enabled, Ordering::Relaxed);
-
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_dsp = shutdown.clone();
 
         // DSP thread: pulls from ring A, processes, pushes to ring B.
-        let dsp_thread = std::thread::Builder::new()
-            .name("roommute-dsp".into())
-            .spawn(move || {
-                #[cfg(windows)]
-                let _mmcss = audio_io::mmcss_pro_audio_for_current_thread();
-                // An empty ring is not news: this thread polls every 2 ms
-                // while frames arrive every 10 ms, so it finds nothing most
-                // of the time even when everything is healthy. Only a long
-                // gap means anything, and that is what gets reported.
-                let mut last_frame_at = std::time::Instant::now();
-                let mut reported_gap = false;
-                let mut last_drop_log: Option<std::time::Instant> = None;
-                while !shutdown_dsp.load(Ordering::Acquire) {
-                    let mut frame = match cons_a.try_pop() {
-                        Some(f) => f,
-                        None => {
-                            if !reported_gap
-                                && last_frame_at.elapsed() > std::time::Duration::from_secs(2)
-                            {
-                                warn!(
-                                    gap_ms = last_frame_at.elapsed().as_millis() as u64,
-                                    "no audio from the microphone — it may have been unplugged, \
-                                     muted, or blocked in Windows privacy settings"
-                                );
-                                reported_gap = true;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(2));
-                            continue;
-                        }
-                    };
-                    if reported_gap {
-                        info!("microphone audio resumed");
-                        reported_gap = false;
-                    }
-                    last_frame_at = std::time::Instant::now();
-                    if let Err(e) = host.process(&mut frame) {
-                        warn!(error = %e, "denoiser error; passing frame through");
-                    }
-                    if prod_b.try_push(frame).is_err() {
-                        // Render is behind — drop. Audible as a click; better
-                        // than blocking the DSP thread.
-                        //
-                        // Throttled: when the render side dies the ring stays
-                        // full forever, and one line per frame is 100 a second
-                        // for as long as the app runs.
-                        let due = last_drop_log.is_none_or(|t: std::time::Instant| {
-                            t.elapsed() > std::time::Duration::from_secs(5)
-                        });
-                        if due {
-                            warn!(
-                                "ring B full; dropping frames (is the output device still there?)"
-                            );
-                            last_drop_log = Some(std::time::Instant::now());
-                        }
-                    }
-                }
-            })
-            .context("spawn dsp thread")?;
-
         // Capture sink: pushes into ring A.
         struct Sink<P: Producer<Item = Frame> + Send> {
             prod: P,
@@ -334,6 +285,92 @@ impl Pipeline {
                 polls: render_polls.clone(),
             }),
         )?;
+
+        // Built after the devices, not before. Loading DeepFilterNet3 takes
+        // a few hundred milliseconds; doing it first meant every failed start
+        // paid for a model it then threw away. On the install that reported
+        // this, the watchdog retried three thousand times against a microphone
+        // that could not open, and each retry loaded the model twice.
+        // DSP setup.
+        let model_path = snapshot.active_model();
+        let denoiser = dsp::build_denoiser(model_path.as_deref(), snapshot.attenuation_db)
+            .context("loading denoiser")?;
+        let denoiser_name = denoiser.name();
+        let (mut host, bypass, stats) = DenoiserHost::new(denoiser);
+        bypass.store(!snapshot.enabled, Ordering::Relaxed);
+
+        // The DSP thread is spawned only once both devices are open.
+        //
+        // It used to start before them, and it owns the denoiser — a whole
+        // DeepFilterNet3 graph. When opening a device failed, `?` returned
+        // without ever setting the shutdown flag, so the thread stayed alive
+        // for the life of the process, polling every 2 ms and holding the
+        // model. The watchdog retried every few seconds and leaked another
+        // one each time: a real install reached 7 GB and a permanent 11% of
+        // the CPU, with 3,085 of them running.
+        //
+        // Nothing above this point owns a thread, so every `?` in between is
+        // now just a drop.
+        DSP_THREADS.fetch_add(1, Ordering::Release);
+        let dsp_thread = std::thread::Builder::new()
+            .name("roommute-dsp".into())
+            .spawn(move || {
+                let _count = ThreadCount;
+                #[cfg(windows)]
+                let _mmcss = audio_io::mmcss_pro_audio_for_current_thread();
+                // An empty ring is not news: this thread polls every 2 ms
+                // while frames arrive every 10 ms, so it finds nothing most
+                // of the time even when everything is healthy. Only a long
+                // gap means anything, and that is what gets reported.
+                let mut last_frame_at = std::time::Instant::now();
+                let mut reported_gap = false;
+                let mut last_drop_log: Option<std::time::Instant> = None;
+                while !shutdown_dsp.load(Ordering::Acquire) {
+                    let mut frame = match cons_a.try_pop() {
+                        Some(f) => f,
+                        None => {
+                            if !reported_gap
+                                && last_frame_at.elapsed() > std::time::Duration::from_secs(2)
+                            {
+                                warn!(
+                                    gap_ms = last_frame_at.elapsed().as_millis() as u64,
+                                    "no audio from the microphone — it may have been unplugged, \
+                                     muted, or blocked in Windows privacy settings"
+                                );
+                                reported_gap = true;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                    };
+                    if reported_gap {
+                        info!("microphone audio resumed");
+                        reported_gap = false;
+                    }
+                    last_frame_at = std::time::Instant::now();
+                    if let Err(e) = host.process(&mut frame) {
+                        warn!(error = %e, "denoiser error; passing frame through");
+                    }
+                    if prod_b.try_push(frame).is_err() {
+                        // Render is behind — drop. Audible as a click; better
+                        // than blocking the DSP thread.
+                        //
+                        // Throttled: when the render side dies the ring stays
+                        // full forever, and one line per frame is 100 a second
+                        // for as long as the app runs.
+                        let due = last_drop_log.is_none_or(|t: std::time::Instant| {
+                            t.elapsed() > std::time::Duration::from_secs(5)
+                        });
+                        if due {
+                            warn!(
+                                "ring B full; dropping frames (is the output device still there?)"
+                            );
+                            last_drop_log = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            })
+            .context("spawn dsp thread")?;
 
         Ok(Self {
             capture,
@@ -819,6 +856,72 @@ mod fallback_tests {
         assert!(
             text.contains("0x8007007E"),
             "the last real reason has to reach the user: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod leak_tests {
+    use std::sync::atomic::Ordering;
+
+    use super::tests::config;
+    use super::{AudioIo, FrameSink, FrameSource, Pipeline, DSP_THREADS};
+    use anyhow::Result;
+
+    /// A sound card where opening the microphone always fails.
+    struct DeadCard;
+
+    impl AudioIo for DeadCard {
+        fn start_capture(&self, _id: &str, _sink: Box<dyn FrameSink>) -> Result<Box<dyn Send>> {
+            anyhow::bail!("GetMixFormat failed (0x8007007E)")
+        }
+        fn start_render(&self, _id: &str, _s: Box<dyn FrameSource>) -> Result<Box<dyn Send>> {
+            Ok(Box::new(()))
+        }
+    }
+
+    /// A card that takes the microphone and then refuses to render.
+    struct NoRender;
+
+    impl AudioIo for NoRender {
+        fn start_capture(&self, _id: &str, _sink: Box<dyn FrameSink>) -> Result<Box<dyn Send>> {
+            Ok(Box::new(()))
+        }
+        fn start_render(&self, _id: &str, _s: Box<dyn FrameSource>) -> Result<Box<dyn Send>> {
+            anyhow::bail!("no such render endpoint")
+        }
+    }
+
+    /// Reported from a real install: 6.8 GB and a permanent 11% of the CPU.
+    ///
+    /// The DSP thread was spawned before the devices were opened, and it owns
+    /// the denoiser — an entire DeepFilterNet3 graph. When opening a device
+    /// failed, `?` returned without ever setting the shutdown flag, so the
+    /// thread stayed alive forever, polling every 2 ms and holding the model.
+    /// The watchdog then retried, and each retry leaked another one.
+    #[test]
+    fn a_failed_start_leaves_no_thread_behind() {
+        let before = DSP_THREADS.load(Ordering::Acquire);
+
+        for _ in 0..5 {
+            assert!(Pipeline::build(&DeadCard, config(true), "in", "out").is_err());
+        }
+        for _ in 0..5 {
+            let io = NoRender;
+            assert!(Pipeline::build(&io, config(true), "in", "out").is_err());
+        }
+
+        // Threads that were asked to stop may take a moment to notice.
+        for _ in 0..100 {
+            if DSP_THREADS.load(Ordering::Acquire) <= before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            DSP_THREADS.load(Ordering::Acquire),
+            before,
+            "ten failed starts left DSP threads running, each holding a model"
         );
     }
 }

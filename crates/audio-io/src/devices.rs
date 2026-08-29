@@ -210,6 +210,14 @@ impl DeviceList {
             .filter_map(|n| self.resolve_capture(n))
             .collect();
         candidates.extend(self.default_capture());
+        // Then every other microphone, as a last resort.
+        //
+        // Preferences and the Windows default are the *likely* answers, not
+        // the only ones. On the install that ran away, both failed to open
+        // while a working microphone sat unused; its owner fixed it by
+        // picking that one from the menu, which is something the app can do
+        // for itself before it starts retrying forever.
+        candidates.extend(self.capture.iter());
         for d in candidates {
             if !out.iter().any(|seen| seen.id == d.id) {
                 out.push(d);
@@ -250,6 +258,51 @@ impl DeviceList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported install had its preferred microphone and the Windows
+    /// default both fail to open, while a working one sat unused. The owner
+    /// fixed it by choosing that one from the menu; the app should get there
+    /// on its own before it starts retrying forever.
+    #[test]
+    fn every_microphone_is_a_candidate_once_the_likely_ones_are_exhausted() {
+        let list = DeviceList {
+            capture: vec![
+                capture("Microphone (Broken)"),
+                capture("Microphone (Works)"),
+            ],
+            render: vec![render("CABLE Input (VB-Audio Virtual Cable)")],
+        };
+        let names: Vec<&str> = list
+            .capture_candidates(&["Microphone (Broken)".to_string()])
+            .iter()
+            .map(|d| d.friendly_name.as_str())
+            .collect();
+
+        assert_eq!(
+            names.first(),
+            Some(&"Microphone (Broken)"),
+            "the preference still leads: {names:?}"
+        );
+        assert!(
+            names.contains(&"Microphone (Works)"),
+            "a microphone nobody named is still better than giving up: {names:?}"
+        );
+    }
+
+    /// Trying the same device twice wastes a model load and doubles the log.
+    #[test]
+    fn no_microphone_is_offered_twice() {
+        let list = DeviceList {
+            capture: vec![capture("Microphone (Yeti)")],
+            render: vec![render("CABLE Input (VB-Audio Virtual Cable)")],
+        };
+        let c = list.capture_candidates(&["Microphone (Yeti)".to_string()]);
+        assert_eq!(
+            c.len(),
+            1,
+            "preference, default and the sweep are the same device"
+        );
+    }
 
     /// Naming the wrong half of the cable is the difference between working
     /// and silent, so this pins which one we hand to the user.
