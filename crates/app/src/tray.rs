@@ -50,6 +50,7 @@ pub fn run(
         items: None,
         last_tooltip_update: Instant::now(),
         health: Health::new(),
+        failures: FailureLog::default(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -72,6 +73,8 @@ struct App {
     items: Option<Items>,
     last_tooltip_update: Instant,
     health: Health,
+    /// Keeps the retry loop from writing the same sentence every 5 seconds.
+    failures: FailureLog,
 }
 
 /// Watches for the pipeline going quiet without saying so.
@@ -135,6 +138,42 @@ const TICK: Duration = Duration::from_millis(500);
 const STALL_AFTER: Duration = Duration::from_secs(2);
 /// Don't hammer the device if it stays gone.
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often a failure that has not changed is worth repeating in the log.
+const REPEAT_FAILURE_AFTER: Duration = Duration::from_secs(300);
+
+/// Decides whether a recovery failure is news.
+///
+/// The watchdog retries every 5 seconds forever, which is right — plug a
+/// microphone in and it recovers with no restart. Logging every attempt is
+/// not: a machine with no working microphone wrote two lines every five
+/// seconds, and the log that should have explained a runaway was 6,000
+/// repetitions of one sentence with the useful lines buried in it.
+///
+/// So: say it the first time, say it again whenever the reason changes, and
+/// otherwise once every five minutes so a long outage is still visible.
+#[derive(Default)]
+struct FailureLog {
+    last: Option<(String, Instant)>,
+}
+
+impl FailureLog {
+    fn should_report(&mut self, reason: &str, now: Instant) -> bool {
+        let news = match &self.last {
+            Some((seen, at)) => seen != reason || now.duration_since(*at) >= REPEAT_FAILURE_AFTER,
+            None => true,
+        };
+        if news {
+            self.last = Some((reason.to_string(), now));
+        }
+        news
+    }
+
+    /// Audio came back, so the next failure is news again.
+    fn clear(&mut self) {
+        self.last = None;
+    }
+}
 
 /// What the watchdog wants done about what it just saw. Two independent
 /// flags rather than one verdict because the badge has to go up *before* a
@@ -214,7 +253,9 @@ impl Health {
             return HealthAction::default();
         }
         self.last_recovery = now;
-        info!("audio is not running; trying again");
+        // No log line here. This fires every five seconds for as long as
+        // audio is down, and the attempt itself is not news — the reason it
+        // failed is, and restart_pipeline_quietly reports that.
         HealthAction {
             restart: true,
             ..Default::default()
@@ -497,13 +538,19 @@ impl App {
         match Pipeline::start(self.cfg.clone()) {
             Ok(p) => {
                 info!(denoiser = p.denoiser_name(), "audio restarted");
+                self.failures.clear();
                 let now = Instant::now();
                 self.health.capture.reset(p.frames_processed(), now);
                 self.health.render.reset(p.render_polls(), now);
                 self.health.stalled = false;
                 self.pipeline = Some(p);
             }
-            Err(e) => warn!(error = %e, "automatic restart failed; will retry"),
+            Err(e) => {
+                let reason = format!("{e:#}");
+                if self.failures.should_report(&reason, Instant::now()) {
+                    warn!(error = %reason, "audio will not start; retrying every 5s");
+                }
+            }
         }
         self.refresh_icon();
     }
@@ -1387,5 +1434,78 @@ mod tests {
             status_text(true, false).is_none(),
             "a healthy pipeline should show its real statistics"
         );
+    }
+}
+
+#[cfg(test)]
+mod failure_log_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{FailureLog, REPEAT_FAILURE_AFTER};
+
+    fn at(base: Instant, secs: f64) -> Instant {
+        base + Duration::from_secs_f64(secs)
+    }
+
+    /// A machine with no working microphone retries every five seconds for as
+    /// long as it is switched on. One real report arrived with 6,000 copies of
+    /// a single sentence, which is how the lines that mattered got lost.
+    #[test]
+    fn the_same_failure_is_not_repeated_every_five_seconds() {
+        let base = Instant::now();
+        let mut log = FailureLog::default();
+
+        assert!(log.should_report("no microphone is available", base));
+        for i in 1..60 {
+            assert!(
+                !log.should_report("no microphone is available", at(base, i as f64 * 5.0)),
+                "attempt {i} said the same thing; saying it again helps nobody"
+            );
+        }
+    }
+
+    /// A different reason means something changed, and that is worth knowing
+    /// straight away — it is the difference between "no microphone" and "this
+    /// microphone will not open".
+    #[test]
+    fn a_changed_reason_is_reported_at_once() {
+        let base = Instant::now();
+        let mut log = FailureLog::default();
+
+        assert!(log.should_report("no microphone is available", base));
+        assert!(
+            log.should_report("GetMixFormat failed (0x8007007E)", at(base, 5.0)),
+            "the reason changed, so it is news"
+        );
+    }
+
+    /// Silence for hours is its own failure: an outage still has to be visible
+    /// to anyone reading the log later.
+    #[test]
+    fn a_long_outage_is_repeated_occasionally() {
+        let base = Instant::now();
+        let mut log = FailureLog::default();
+        let reason = "no microphone is available";
+
+        assert!(log.should_report(reason, base));
+        let just_before = REPEAT_FAILURE_AFTER.as_secs_f64() - 1.0;
+        assert!(!log.should_report(reason, at(base, just_before)));
+        assert!(
+            log.should_report(reason, at(base, REPEAT_FAILURE_AFTER.as_secs_f64() + 0.1)),
+            "a five-minute reminder keeps a long outage visible"
+        );
+    }
+
+    /// Recovering resets it, so the next failure is reported immediately
+    /// rather than swallowed as a repeat of something hours old.
+    #[test]
+    fn recovery_makes_the_next_failure_news_again() {
+        let base = Instant::now();
+        let mut log = FailureLog::default();
+        let reason = "no microphone is available";
+
+        assert!(log.should_report(reason, base));
+        log.clear();
+        assert!(log.should_report(reason, at(base, 5.0)));
     }
 }
