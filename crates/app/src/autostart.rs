@@ -46,7 +46,7 @@ fn open_run_key(access: REG_SAM_FLAGS) -> Result<Key> {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
             RUN_KEY,
-            0,
+            None,
             None,
             REG_OPTION_NON_VOLATILE,
             access,
@@ -96,7 +96,7 @@ fn set_entry(name: PCWSTR, exe: &Path, enabled: bool) -> Result<()> {
             .chain(std::iter::once(0))
             .flat_map(u16::to_le_bytes)
             .collect();
-        unsafe { RegSetValueExW(key.0, name, 0, REG_SZ, Some(&bytes)) }
+        unsafe { RegSetValueExW(key.0, name, None, REG_SZ, Some(&bytes)) }
     } else {
         let status = unsafe { RegDeleteValueW(key.0, name) };
         // Deleting something that was never there is a success as far as the

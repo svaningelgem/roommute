@@ -36,7 +36,7 @@ muda = "0.15"
 # Only what we actually call: the single-instance mutex, console attach for
 # the CLI modes, the HKCU Run key for start-at-login, and MessageBoxW for
 # reporting fatal errors when no console is attached.
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
