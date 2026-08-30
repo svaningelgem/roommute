@@ -91,6 +91,36 @@ workflows download it into `target/debug` before running tests. Locally they
 skip with a message if it is missing; when `CI` is set they fail instead, so
 they cannot silently stop running while the build stays green.
 
+## Process-global state is where the flakes come from
+
+Three tests in this repository have been flaky, and all three for the same
+reason: they observed something shared by the whole process while their
+siblings, running in parallel, changed it underneath them.
+
+| test | what it watched | what broke it |
+|---|---|---|
+| `a_model_is_only_offered_when_the_file_exists` | the directory the test binary sits in | a sibling wrote a model there on purpose |
+| `creating_and_dropping_many_events_does_not_accumulate_handles` | the process handle count | siblings opening handles inside the window |
+| `an_event_is_usable_..._when_it_is_dropped` | one handle *value* after closing it | Windows recycled the number to a sibling |
+
+Each failed on CI and passed locally, sometimes for weeks, which is the worst
+shape a test can have: it trains you to re-run rather than read.
+
+The fixes are worth copying, in order of preference:
+
+1. **Remove the sharing.** `Config::model_in` takes the directory as a
+   parameter, so each test uses one of its own. No lock, no window, nothing to
+   get unlucky with.
+2. **Make the signal dwarf the noise.** A leak adds one handle per event, so
+   500 events against a tolerance of 50 puts the real thing an order of
+   magnitude clear of anything a sibling can do.
+3. **Stop asserting what cannot be known.** A handle value after closing tells
+   you nothing — the OS may have reissued it. Delete that assertion and let
+   the counting test cover closure, which it does more strongly anyway.
+
+Reaching for a mutex is the option that looks easiest and ages worst: it
+serialises the suite, and it only covers the tests that remember to take it.
+
 ## Things no test guards
 
 Two fixes in this codebase have no test behind them, and it is worth saying so

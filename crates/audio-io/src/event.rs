@@ -58,21 +58,26 @@ mod tests {
         unsafe { GetHandleInformation(h, &mut flags).is_ok() }
     }
 
+    /// A live event is a real, open handle.
+    ///
+    /// This deliberately stops before re-checking the handle *after* the drop.
+    /// Windows recycles handle values: once closed, the same number can be
+    /// handed straight back out, and the other tests in this binary open
+    /// registry keys, files and threads throughout. A sibling landing on that
+    /// value in the window between the drop and the check makes
+    /// GetHandleInformation succeed and reports a leak that never happened —
+    /// which is what failed one CI run while passing every other.
+    ///
+    /// That dropping really closes it is covered by the test below, across
+    /// 500 handles. A leak shows there as +500 against a tolerance of 50, and
+    /// no recycled value can fake that.
     #[test]
-    fn an_event_is_usable_while_it_lives_and_closed_when_it_is_dropped() {
+    fn a_live_event_is_an_open_handle() {
         let event = Event::new().expect("create an event");
         let raw = event.handle();
-        assert!(!raw.is_invalid());
-        assert!(still_open(raw), "a fresh event should be open");
-
+        assert!(!raw.is_invalid(), "a fresh event must be a real handle");
+        assert!(still_open(raw), "and it must be open while the guard lives");
         drop(event);
-
-        assert!(
-            !still_open(raw),
-            "the handle is still open after the guard was dropped — every \
-             pipeline rebuild leaks one, and the watchdog rebuilds on every \
-             dropout"
-        );
     }
 
     /// The failure this guards is cumulative, so prove it does not creep:
