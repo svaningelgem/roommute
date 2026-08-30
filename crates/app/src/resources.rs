@@ -25,7 +25,11 @@ fn percentages(cpu: Duration, wall: Duration, cores: f64) -> (f64, f64) {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
-    pub cpu_of_one_core: f64,
+    /// Against the whole machine, the basis Task Manager uses.
+    ///
+    /// `percentages` still computes the per-core figure, and its tests pin
+    /// the relationship between the two, because that relationship is what
+    /// made the tray meter look like it disagreed with Task Manager.
     pub cpu_of_machine: f64,
     pub working_set_mb: f64,
     pub over: Duration,
@@ -58,9 +62,8 @@ impl ProcessMeter {
             Some((then, before)) => {
                 let wall = now.duration_since(then);
                 let used = cpu.checked_sub(before).unwrap_or_default();
-                let (of_one, of_machine) = percentages(used, wall, self.cores);
+                let (_of_one_core, of_machine) = percentages(used, wall, self.cores);
                 Some(Sample {
-                    cpu_of_one_core: of_one,
                     cpu_of_machine: of_machine,
                     working_set_mb,
                     over: wall,

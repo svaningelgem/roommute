@@ -619,35 +619,22 @@ impl App {
         self.log_resource_use(now);
     }
 
-    /// Once a minute, what this process actually cost over that minute.
+    /// Once a minute, what this process cost over that minute.
     ///
-    /// Both normalisations, because reporting one invites the other to be
-    /// read into it: `of one core` is comparable with the tray's DSP load,
-    /// `of machine` is what Task Manager shows.
+    /// Reported against the whole system — the same basis Task Manager uses,
+    /// so the two can be compared without dividing anything by hand. The
+    /// tray's DSP figure answers a different question and stays where it is.
     fn log_resource_use(&mut self, now: Instant) {
         if now.duration_since(self.last_meter_log) < METER_INTERVAL {
             return;
         }
         self.last_meter_log = now;
         if let Some(s) = self.meter.sample(now) {
-            // The tray's DSP figure goes in the same line on purpose: it is
-            // the one people compare against Task Manager, and seeing all
-            // three together is what makes the difference obvious.
-            let dsp_load = self
-                .pipeline
-                .as_ref()
-                .map(|p| {
-                    let st = p.stats();
-                    realtime_load_percent(
-                        st.frames.load(Ordering::Relaxed),
-                        st.dsp_ns.load(Ordering::Relaxed),
-                    )
-                })
-                .unwrap_or(0.0);
             info!(
-                dsp_load = format!("{dsp_load:.1}% of realtime"),
-                cpu_of_one_core = format!("{:.1}%", s.cpu_of_one_core),
-                cpu_of_machine = format!("{:.2}%", s.cpu_of_machine),
+                // Three decimals: a healthy pipeline is a fraction of one
+                // core out of many, so two would round most of it to 0.00
+                // and hide exactly the drift worth watching for.
+                cpu = format!("{:.3}% of system", s.cpu_of_machine),
                 memory_mb = format!("{:.1}", s.working_set_mb),
                 over_s = s.over.as_secs(),
                 running = self.pipeline.is_some(),
