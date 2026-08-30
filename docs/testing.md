@@ -18,8 +18,8 @@ cargo install cargo-llvm-cov
 
 ## The coverage ratchet
 
-CI enforces a **minimum** line coverage, currently **71%**, just under the
-72.5% actually reached. A pull request may raise that number; it must
+CI enforces a **minimum** line coverage, currently **74%**, just under the
+75.4% actually reached. A pull request may raise that number; it must
 never lower it. When coverage improves, bump `--fail-under-lines` in
 `.github/workflows/ci.yml` **and** `.github/workflows/release.yml` in the same
 PR — a tag must never publish something a pull request would have failed.

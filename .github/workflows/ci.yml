@@ -83,7 +83,7 @@ jobs:
         # here whenever coverage improves; the goal is 100%, but see
         # docs/testing.md for why large parts of this codebase cannot be
         # covered without a hardware abstraction that does not exist yet.
-        run: cargo llvm-cov --all-features --fail-under-lines 71
+        run: cargo llvm-cov --all-features --fail-under-lines 74
 
       - name: Coverage summary
         if: always()
