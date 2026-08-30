@@ -51,6 +51,8 @@ pub fn run(
         last_tooltip_update: Instant::now(),
         health: Health::new(),
         failures: FailureLog::default(),
+        meter: crate::resources::ProcessMeter::new(),
+        last_meter_log: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -75,6 +77,9 @@ struct App {
     health: Health,
     /// Keeps the retry loop from writing the same sentence every 5 seconds.
     failures: FailureLog,
+    /// What this process costs, logged once a minute.
+    meter: crate::resources::ProcessMeter,
+    last_meter_log: Instant,
 }
 
 /// Watches for the pipeline going quiet without saying so.
@@ -138,6 +143,9 @@ const TICK: Duration = Duration::from_millis(500);
 const STALL_AFTER: Duration = Duration::from_secs(2);
 /// Don't hammer the device if it stays gone.
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often to record what this process costs.
+const METER_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often a failure that has not changed is worth repeating in the log.
 const REPEAT_FAILURE_AFTER: Duration = Duration::from_secs(300);
@@ -364,11 +372,17 @@ fn choose_denoiser(cfg: &mut Config, onnx: bool) {
     cfg.use_onnx = onnx;
 }
 
-/// Share of real time the denoiser is using, as a percentage.
+/// Share of the realtime budget the denoiser is using, as a percentage.
 ///
 /// Each frame is 10 ms of audio, so the budget is 10 ms of processing per
 /// frame; 100% means the DSP is exactly keeping up and any hiccup drops audio.
-fn cpu_percent(frames: u64, total_dsp_ns: u64) -> f64 {
+///
+/// Not CPU usage, and it used to say it was. On a 32-thread machine a
+/// perfectly healthy 7% here is 0.2% of the machine, which Task Manager shows
+/// as 0 — so the tooltip and Task Manager appeared to contradict each other
+/// while both were right. The number is a headroom meter; the label says so
+/// now, and `resources` logs the actual process cost alongside it.
+fn realtime_load_percent(frames: u64, total_dsp_ns: u64) -> f64 {
     if frames == 0 {
         return 0.0;
     }
@@ -601,6 +615,44 @@ impl App {
         }
         if action.restart {
             self.restart_pipeline_quietly();
+        }
+        self.log_resource_use(now);
+    }
+
+    /// Once a minute, what this process actually cost over that minute.
+    ///
+    /// Both normalisations, because reporting one invites the other to be
+    /// read into it: `of one core` is comparable with the tray's DSP load,
+    /// `of machine` is what Task Manager shows.
+    fn log_resource_use(&mut self, now: Instant) {
+        if now.duration_since(self.last_meter_log) < METER_INTERVAL {
+            return;
+        }
+        self.last_meter_log = now;
+        if let Some(s) = self.meter.sample(now) {
+            // The tray's DSP figure goes in the same line on purpose: it is
+            // the one people compare against Task Manager, and seeing all
+            // three together is what makes the difference obvious.
+            let dsp_load = self
+                .pipeline
+                .as_ref()
+                .map(|p| {
+                    let st = p.stats();
+                    realtime_load_percent(
+                        st.frames.load(Ordering::Relaxed),
+                        st.dsp_ns.load(Ordering::Relaxed),
+                    )
+                })
+                .unwrap_or(0.0);
+            info!(
+                dsp_load = format!("{dsp_load:.1}% of realtime"),
+                cpu_of_one_core = format!("{:.1}%", s.cpu_of_one_core),
+                cpu_of_machine = format!("{:.2}%", s.cpu_of_machine),
+                memory_mb = format!("{:.1}", s.working_set_mb),
+                over_s = s.over.as_secs(),
+                running = self.pipeline.is_some(),
+                "resource use"
+            );
         }
     }
 
@@ -910,7 +962,7 @@ fn tooltip(p: &Pipeline) -> String {
     tooltip_text(
         p.denoiser_name(),
         p.is_enabled(),
-        cpu_percent(frames, total_ns),
+        realtime_load_percent(frames, total_ns),
         peak_ns as f64 / 1_000_000.0,
     )
 }
@@ -1401,14 +1453,14 @@ mod tests {
     // ---- what the tooltip says ----------------------------------------
 
     #[test]
-    fn the_cpu_meter_reads_a_tenth_of_realtime_as_ten_percent() {
+    fn the_load_meter_reads_a_tenth_of_realtime_as_ten_percent() {
         // A frame is 10 ms of audio, so 1 ms of DSP per frame is 10%.
-        assert!((cpu_percent(100, 100 * 1_000_000) - 10.0).abs() < 1e-9);
+        assert!((realtime_load_percent(100, 100 * 1_000_000) - 10.0).abs() < 1e-9);
         // Exactly keeping up is 100%.
-        assert!((cpu_percent(50, 50 * 10_000_000) - 100.0).abs() < 1e-9);
+        assert!((realtime_load_percent(50, 50 * 10_000_000) - 100.0).abs() < 1e-9);
         // No frames yet must not divide by zero.
-        assert_eq!(cpu_percent(0, 0), 0.0);
-        assert_eq!(cpu_percent(0, 12_345), 0.0);
+        assert_eq!(realtime_load_percent(0, 0), 0.0);
+        assert_eq!(realtime_load_percent(0, 12_345), 0.0);
     }
 
     #[test]

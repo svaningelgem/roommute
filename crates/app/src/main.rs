@@ -28,6 +28,7 @@ mod firstrun;
 mod log_format;
 mod offline;
 mod pipeline;
+mod resources;
 #[cfg(windows)]
 mod tray;
 
