@@ -33,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-ringbuf = "0.4"
+ringbuf = "0.5"
 crossbeam-channel = "0.5"
 
 # tract validates node-name uniqueness only when debug assertions are on, and
