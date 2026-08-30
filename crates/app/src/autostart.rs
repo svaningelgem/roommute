@@ -135,9 +135,12 @@ fn read_entry(name: PCWSTR) -> Option<String> {
         {
             return None;
         }
-        let wide: Vec<u16> = buf
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        // Indexed rather than `chunks_exact(2)`: clippy 1.98 wants
+        // `as_chunks::<2>()` for a constant size, and that needs Rust 1.88 —
+        // above this crate's declared rust-version. This reads the same and
+        // compiles anywhere.
+        let wide: Vec<u16> = (0..buf.len() / 2)
+            .map(|i| u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]))
             .take_while(|&c| c != 0)
             .collect();
         Some(String::from_utf16_lossy(&wide))

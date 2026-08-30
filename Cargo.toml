@@ -9,7 +9,10 @@ members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.82 is where `Option::is_none_or` stabilised, which the pipeline uses.
+# Nothing verifies this — CI builds with stable — so treat it as the lowest
+# version known to work rather than the lowest that does.
+rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 authors = [
     "Yashsomalkar <Yashsomalkar@users.noreply.github.com>",
