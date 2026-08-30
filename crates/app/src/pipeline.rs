@@ -228,15 +228,27 @@ impl Pipeline {
         // Capture sink: pushes into ring A.
         struct Sink<P: Producer<Item = Frame> + Send> {
             prod: P,
+            /// Throttles the drop warning, like the render side already does.
+            last_drop_log: Option<std::time::Instant>,
         }
         impl<P: Producer<Item = Frame> + Send> audio_io::wasapi_capture::FrameSink for Sink<P> {
             fn on_frame(&mut self, frame: &Frame) {
                 if self.prod.try_push(*frame).is_err() {
-                    // DSP behind — overwrite oldest by popping (we don't
-                    // have direct access here; the simplest cheap option is
-                    // to just drop. Audible as a tiny click; far better
-                    // than blocking the audio engine.)
-                    tracing::warn!("ring A full; dropping captured frame");
+                    // DSP behind — drop rather than block the audio engine.
+                    // Audible as a tiny click, which is the better trade.
+                    //
+                    // Throttled, because the guaranteed case is startup:
+                    // capture opens before the model finishes loading, so
+                    // ~200 ms of frames arrive with nothing draining them
+                    // yet. Untamed that was 28 identical lines on every
+                    // single start, burying the lines worth reading.
+                    let due = self.last_drop_log.is_none_or(|t: std::time::Instant| {
+                        t.elapsed() > std::time::Duration::from_secs(5)
+                    });
+                    if due {
+                        self.last_drop_log = Some(std::time::Instant::now());
+                        tracing::warn!("ring A full; dropping captured frames (DSP behind)");
+                    }
                 }
             }
             fn on_glitch(&mut self, flags: u32) {
@@ -244,7 +256,13 @@ impl Pipeline {
             }
         }
 
-        let capture = io.start_capture(input_id, Box::new(Sink { prod: prod_a }))?;
+        let capture = io.start_capture(
+            input_id,
+            Box::new(Sink {
+                prod: prod_a,
+                last_drop_log: None,
+            }),
+        )?;
 
         // Render source: pulls from ring B.
         struct Source<C: Consumer<Item = Frame> + Send> {
