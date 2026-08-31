@@ -51,6 +51,7 @@ pub fn run(
         last_tooltip_update: Instant::now(),
         health: Health::new(),
         failures: FailureLog::default(),
+        last_glitches: 0,
         meter: crate::resources::ProcessMeter::new(),
         last_meter_log: Instant::now(),
     };
@@ -77,6 +78,8 @@ struct App {
     health: Health,
     /// Keeps the retry loop from writing the same sentence every 5 seconds.
     failures: FailureLog,
+    /// Glitch count at the previous health line, to report a rate.
+    last_glitches: u64,
     /// What this process costs, logged once a minute.
     meter: crate::resources::ProcessMeter,
     last_meter_log: Instant,
@@ -629,6 +632,13 @@ impl App {
             return;
         }
         self.last_meter_log = now;
+        // Glitches over the same window. Audio can flow perfectly through
+        // thousands of these, so it is not a warning — but a device that has
+        // gone strange shows up here and nowhere else.
+        let total = self.pipeline.as_ref().map(|p| p.glitches()).unwrap_or(0);
+        let glitches = total.saturating_sub(self.last_glitches);
+        self.last_glitches = total;
+
         if let Some(s) = self.meter.sample(now) {
             info!(
                 // Three decimals: a healthy pipeline is a fraction of one
@@ -636,6 +646,7 @@ impl App {
                 // and hide exactly the drift worth watching for.
                 cpu = format!("{:.3}% of system", s.cpu_of_machine),
                 memory_mb = format!("{:.1}", s.working_set_mb),
+                glitches,
                 over_s = s.over.as_secs(),
                 running = self.pipeline.is_some(),
                 "resource use"

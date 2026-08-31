@@ -26,6 +26,7 @@ mod console;
 #[cfg(windows)]
 mod firstrun;
 mod log_format;
+mod logfile;
 mod offline;
 mod pipeline;
 mod resources;
@@ -44,26 +45,14 @@ use tracing::info;
 /// hand over when they paste a log into a bug report.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
-fn rotate_log_if_large(log_file: &std::path::Path, max_bytes: u64) {
-    let too_big = std::fs::metadata(log_file)
-        .map(|m| m.len() > max_bytes)
-        .unwrap_or(false);
-    if too_big {
-        let _ = std::fs::rename(log_file, log_file.with_extension("log.old"));
-    }
-}
-
 fn init_tracing() {
     let log_dir = config::log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let log_file = log_dir.join("roommute.log");
-    rotate_log_if_large(&log_file, MAX_LOG_BYTES);
-
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file)
-        .ok();
+    // Rotates as it writes, not only here. Checking at startup alone meant the
+    // check never fired for the processes that needed it: something running
+    // for a day passed the limit and kept going.
+    let file = logfile::RotatingLog::new(log_file, MAX_LOG_BYTES).ok();
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,roommute=debug"));
@@ -604,13 +593,6 @@ mod parking_lot_compat {
 mod tests {
     use super::*;
 
-    fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("roommute-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
-
     // `--denoise` used to pass `None` when there was no --model flag, which
     // sent it to RNNoise while the tray ran DeepFilterNet3. The numbers it
     // printed were therefore not the app's, and the README quoted them.
@@ -650,43 +632,6 @@ mod tests {
     #[test]
     fn no_flag_and_no_config_means_the_built_in_fallback() {
         assert_eq!(offline_model(None, None, false), None);
-    }
-
-    #[test]
-    fn small_logs_are_left_alone() {
-        let dir = scratch_dir("small-log");
-        let log = dir.join("roommute.log");
-        std::fs::write(&log, b"a few lines of startup chatter").unwrap();
-
-        rotate_log_if_large(&log, 1024);
-
-        assert!(log.exists(), "small log should not be rotated");
-        assert!(!log.with_extension("log.old").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn oversized_logs_are_rolled_over() {
-        let dir = scratch_dir("big-log");
-        let log = dir.join("roommute.log");
-        std::fs::write(&log, vec![b'x'; 2048]).unwrap();
-
-        rotate_log_if_large(&log, 1024);
-
-        assert!(!log.exists(), "oversized log should have been moved aside");
-        let rolled = log.with_extension("log.old");
-        assert!(rolled.exists(), "expected roommute.log.old");
-        assert_eq!(std::fs::metadata(&rolled).unwrap().len(), 2048);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn missing_log_is_not_an_error() {
-        let dir = scratch_dir("no-log");
-        // First run: nothing to rotate, and nothing should blow up.
-        rotate_log_if_large(&dir.join("roommute.log"), 1024);
-        assert!(!dir.join("roommute.log.old").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

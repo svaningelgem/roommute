@@ -20,9 +20,6 @@ use dsp::{DenoiserHost, Stats};
 use crate::config::Config;
 use crate::parking_lot_compat::RwLock;
 
-/// How often a run of capture glitches is worth a line.
-const GLITCH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
 const RING_FRAMES: usize = 8;
 
 /// Where the pipeline gets and puts its audio.
@@ -68,6 +65,8 @@ pub struct Pipeline {
     stats: Arc<Stats>,
     /// See [`Pipeline::render_polls`].
     render_polls: Arc<AtomicU64>,
+    /// Capture discontinuities the audio engine reported, cumulative.
+    glitches: Arc<AtomicU64>,
     denoiser_name: &'static str,
     /// Used to ask the DSP thread to exit cleanly when we drop.
     shutdown: Arc<AtomicBool>,
@@ -228,14 +227,16 @@ impl Pipeline {
         let shutdown_dsp = shutdown.clone();
 
         // DSP thread: pulls from ring A, processes, pushes to ring B.
+        let glitches = Arc::new(AtomicU64::new(0));
+
         // Capture sink: pushes into ring A.
         struct Sink<P: Producer<Item = Frame> + Send> {
             prod: P,
             /// Throttles the drop warning, like the render side already does.
             last_drop_log: Option<std::time::Instant>,
-            /// Glitches seen since the last line, and when that line was.
-            glitches: u64,
-            last_glitch_log: Option<std::time::Instant>,
+            /// Shared with the pipeline, which reports the rate once a
+            /// minute beside CPU and memory.
+            glitches: Arc<AtomicU64>,
         }
         impl<P: Producer<Item = Frame> + Send> audio_io::wasapi_capture::FrameSink for Sink<P> {
             fn on_frame(&mut self, frame: &Frame) {
@@ -257,32 +258,18 @@ impl Pipeline {
                     }
                 }
             }
-            fn on_glitch(&mut self, flags: u32) {
-                // Throttled with a count, because this is not always one
-                // event. After a device disconnected and came back, one
-                // machine had the engine set the discontinuity flag on every
-                // single buffer for 23 minutes: 6,000 lines a minute, 13 MB
-                // of log, and several times the normal CPU spent writing it.
-                // Audio was flowing fine throughout — no dropped frames, no
-                // underruns — so the flag was the only symptom, and the
-                // logging was the only real cost.
+            fn on_glitch(&mut self, _flags: u32) {
+                // Counted, not narrated. The engine raises this per buffer, so
+                // a device that comes back in a bad state can set it a hundred
+                // times a second: one machine produced 134,568 in a day,
+                // 97,272 inside one hour, while audio flowed normally the
+                // whole time. Nothing here acts on a glitch, and a warning
+                // nobody acts on is noise however well it is throttled.
                 //
-                // The count is the useful part: one glitch and a hundred a
-                // second are different situations, and a rate is what tells
-                // them apart.
-                self.glitches += 1;
-                let due = self
-                    .last_glitch_log
-                    .is_none_or(|t: std::time::Instant| t.elapsed() > GLITCH_LOG_INTERVAL);
-                if due {
-                    let n = std::mem::take(&mut self.glitches);
-                    self.last_glitch_log = Some(std::time::Instant::now());
-                    tracing::warn!(
-                        flags,
-                        count = n,
-                        "capture glitches reported by audio engine"
-                    );
-                }
+                // The rate still matters when someone reports crackling, so it
+                // rides along with the once-a-minute health line rather than
+                // being an event of its own.
+                self.glitches.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -291,8 +278,7 @@ impl Pipeline {
             Box::new(Sink {
                 prod: prod_a,
                 last_drop_log: None,
-                glitches: 0,
-                last_glitch_log: None,
+                glitches: glitches.clone(),
             }),
         )?;
 
@@ -429,6 +415,7 @@ impl Pipeline {
             bypass,
             stats,
             render_polls,
+            glitches,
             denoiser_name,
             shutdown,
         })
@@ -467,6 +454,14 @@ impl Pipeline {
     /// reaches the far end of the call at all. This one stops when the render
     /// thread stops asking for audio, which is the only honest signal that
     /// half of the pipeline is still running.
+    /// Capture discontinuities since the pipeline started.
+    ///
+    /// Cumulative on purpose: the caller subtracts to get a rate, and a rate
+    /// is the only form of this worth reading.
+    pub fn glitches(&self) -> u64 {
+        self.glitches.load(Ordering::Relaxed)
+    }
+
     pub fn render_polls(&self) -> u64 {
         self.render_polls.load(Ordering::Relaxed)
     }
