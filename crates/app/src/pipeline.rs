@@ -20,6 +20,9 @@ use dsp::{DenoiserHost, Stats};
 use crate::config::Config;
 use crate::parking_lot_compat::RwLock;
 
+/// How often a run of capture glitches is worth a line.
+const GLITCH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 const RING_FRAMES: usize = 8;
 
 /// Where the pipeline gets and puts its audio.
@@ -230,6 +233,9 @@ impl Pipeline {
             prod: P,
             /// Throttles the drop warning, like the render side already does.
             last_drop_log: Option<std::time::Instant>,
+            /// Glitches seen since the last line, and when that line was.
+            glitches: u64,
+            last_glitch_log: Option<std::time::Instant>,
         }
         impl<P: Producer<Item = Frame> + Send> audio_io::wasapi_capture::FrameSink for Sink<P> {
             fn on_frame(&mut self, frame: &Frame) {
@@ -252,7 +258,31 @@ impl Pipeline {
                 }
             }
             fn on_glitch(&mut self, flags: u32) {
-                tracing::warn!(flags, "capture glitch reported by audio engine");
+                // Throttled with a count, because this is not always one
+                // event. After a device disconnected and came back, one
+                // machine had the engine set the discontinuity flag on every
+                // single buffer for 23 minutes: 6,000 lines a minute, 13 MB
+                // of log, and several times the normal CPU spent writing it.
+                // Audio was flowing fine throughout — no dropped frames, no
+                // underruns — so the flag was the only symptom, and the
+                // logging was the only real cost.
+                //
+                // The count is the useful part: one glitch and a hundred a
+                // second are different situations, and a rate is what tells
+                // them apart.
+                self.glitches += 1;
+                let due = self
+                    .last_glitch_log
+                    .is_none_or(|t: std::time::Instant| t.elapsed() > GLITCH_LOG_INTERVAL);
+                if due {
+                    let n = std::mem::take(&mut self.glitches);
+                    self.last_glitch_log = Some(std::time::Instant::now());
+                    tracing::warn!(
+                        flags,
+                        count = n,
+                        "capture glitches reported by audio engine"
+                    );
+                }
             }
         }
 
@@ -261,6 +291,8 @@ impl Pipeline {
             Box::new(Sink {
                 prod: prod_a,
                 last_drop_log: None,
+                glitches: 0,
+                last_glitch_log: None,
             }),
         )?;
 
