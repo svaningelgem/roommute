@@ -147,7 +147,7 @@ weights are provably genuine — 23 of its large tensors match the published
 conv/bias forms expected from a pytorch 1.13.1 graph after ORT optimisation.
 
 So it is not a trust problem; it is a reproducibility one. It cannot be
-regenerated from source, which is the reason `dfn3_ours.tar.gz` exists and is
+regenerated from source, which is the reason `models/dfn3/` exists and is
 what ships.
 
 ## Re-checking a change

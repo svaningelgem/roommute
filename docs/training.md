@@ -14,7 +14,9 @@ existed — the fear was that we had no right to ship anything, and we do. See
 
 Two training runs were attempted anyway, to try to beat DFN3 at competing
 speech specifically. Both produced models that suppress rather than separate;
-neither is used. What follows is the environment, the dataset choices and the
+neither is used. Run 3 below repeats the attempt on upstream's own recipe; a
+model that holds up would also stop the shipped weights depending on how
+upstream's licence grant is read. What follows is the environment, the dataset choices and the
 failure analysis, for anyone who wants to try again.
 
 ## Environment
@@ -231,4 +233,38 @@ three are in the schedule rather than the data:
 A run without batch-size scheduling sees a very different effective learning
 rate over its life, and 60 epochs with patience 8 stops a long way short of
 where DFN3 was still improving. Start there before touching the data.
+
+(`40/9999` in upstream's shipped config is harmless: `df.train` caps each
+scheduled size at `batch_size`, 64, so the schedule is 16/24/32/64.)
+
+## Run 3: upstream's recipe, our data
+
+Everything above as one command, from Windows:
+
+```bash
+wsl -d Ubuntu -u root -- bash /mnt/e/roommute/scripts/training/train.sh
+```
+
+[`scripts/training/`](../scripts/training/) downloads the corpora, builds the
+RIRs, interferers, speaker splits and HDF5 files into `/root/dfn-data` (each
+step stamped in `.done/`, so an interrupted run resumes), writes
+`/root/dfn-run3/config.ini` once, and trains. The config is upstream DFN3's own
+with only `device` and `log_timings` changed, so if run 3 fails the same way,
+the data is to blame and not the recipe.
+
+Budget: ~1.5 h of downloads, ~1 h of prep, then ~7 min per epoch at batch 64
+(the batch-16 epochs at the start are slower). Plan on 120 epochs taking two
+nights. Rerunning the same command resumes from the latest checkpoint. Each new
+batch size makes MIOpen recompile its kernels, which takes minutes, but happens
+only four times.
+
+Keep the terminal open, and stop Windows from sleeping. A sleeping host
+suspends the WSL VM and the run with it.
+
+To judge it, export the best checkpoint and score it as in
+[Judging the result](#judging-the-result):
+
+```bash
+uv run scripts/export_dfn3.py models/run3-export //wsl.localhost/Ubuntu/root/dfn-run3
+```
 

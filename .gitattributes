@@ -11,3 +11,7 @@ models/dfn3/** -text
 *.mp4 binary
 *.onnx binary
 *.tar.gz binary
+
+# Shell scripts run inside WSL. A CRLF checkout turns `set -u` into
+# `set -u\r` and bash refuses the file, so pin them to LF on every platform.
+*.sh text eol=lf

@@ -13,10 +13,11 @@
 # ///
 """Convert DeepFilterNet3's published weights into the model RoomMute runs.
 
-    uv run scripts/export_dfn3.py [OUTPUT_DIR]
+    uv run scripts/export_dfn3.py [OUTPUT_DIR] [MODEL_DIR]
 
 That is the whole thing. uv installs the dependencies into a throwaway
-environment, the script downloads the official checkpoint, and it writes a
+environment, the script downloads the official checkpoint (or uses MODEL_DIR,
+a training run directory holding `config.ini` and `checkpoints/`), and it writes a
 `DeepFilterNet3_onnx.tar.gz` that `roommute --model <that file>` loads
 directly. Nothing needs to be installed first except uv, and nothing is left
 behind on your system.
@@ -132,8 +133,10 @@ def patch_windows_url_bug() -> None:
 
 def main() -> None:
     out = Path(sys.argv[1] if len(sys.argv) > 1 else "models/dfn3-export").resolve()
-    work = out / "checkpoint"
-    model_dir = fetch_checkpoint(work)
+    if len(sys.argv) > 2:
+        model_dir = Path(sys.argv[2]).resolve()
+    else:
+        model_dir = fetch_checkpoint(out / "checkpoint")
 
     out.mkdir(parents=True, exist_ok=True)
     patch_windows_url_bug()
